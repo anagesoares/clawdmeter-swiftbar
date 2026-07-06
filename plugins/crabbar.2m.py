@@ -85,7 +85,7 @@ SCOPE_ORDER = [
     "seven_day_overage_included",
 ]
 SCOPE_LABEL = {
-    "five_hour": "Sessão (5h)",
+    "five_hour": "Sessão",
     "seven_day": "Semanal · todos os modelos",
     "seven_day_opus": "Semanal · Opus",
     "seven_day_sonnet": "Semanal · Sonnet",
@@ -322,6 +322,32 @@ def _as_pct(util):
         return None
 
 
+_WD = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]  # weekday(): seg=0
+
+
+def _reset_abs(resets_at):
+    """resets_at (ISO 8601) → horário local de quando reseta ('quando', não 'quanto falta').
+
+    hoje → '12:57'; amanhã → 'amanhã 06:00'; esta semana → 'qui 06:00';
+    mais longe → '09/07 06:00'. Absoluto → não envelhece com o cache.
+    """
+    if not resets_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00")).astimezone()
+    except (ValueError, TypeError):
+        return None
+    now = datetime.now().astimezone()
+    days = (dt.date() - now.date()).days
+    if days <= 0:
+        return dt.strftime("%H:%M")
+    if days == 1:
+        return "amanhã " + dt.strftime("%H:%M")
+    if days <= 6:
+        return _WD[dt.weekday()] + dt.strftime(" %H:%M")
+    return dt.strftime("%d/%m %H:%M")
+
+
 def _mins_until(resets_at):
     """resets_at (ISO 8601, ou epoch em segundos) → minutos até o reset."""
     if resets_at in (None, ""):
@@ -407,7 +433,7 @@ def _parse_usage_body(body):
             "label": label_for(key),
             "short": short_for(key),
             "used": used,
-            "reset": _mins_until(val.get("resets_at")),
+            "reset_at": val.get("resets_at"),  # ISO cru → horário absoluto no render
         })
     if not limits:
         return None
@@ -540,11 +566,8 @@ def main():
         print(f"{hdr} | {HEAD}")
         for l in limits:
             shown = disp_pct(l["used"])
-            # se stale, o reset foi calculado há `age` min → ajusta.
-            rem = l["reset"]
-            if rem is not None and stale:
-                rem = max(0, rem - age)
-            reset = f"reset em {fmt_mins(rem)}" if rem is not None else ""
+            when = _reset_abs(l.get("reset_at"))  # absoluto: não envelhece com o cache
+            reset = f"reseta {when}" if when else ""
             color = DIM if stale else color_for(l["used"])
             print(f"{l['label']}:  {shown}%   {reset} | "
                   f"size=14 font=Menlo color={color}")
