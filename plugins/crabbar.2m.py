@@ -631,8 +631,9 @@ def main():
                        ("window", "Janela (5h · 7d)"),
                        ("reset", "Percentual + reset")):
         _mark = "✓ " if _key == _cur else ""
+        # sem refresh=true: o próprio --set-title redesenha DEPOIS de gravar (1 clique).
         print(f"-- {_mark}{_lbl} | bash=\"{SELF}\" param1=--set-title "
-              f"param2={_key} terminal=false refresh=true")
+              f"param2={_key} terminal=false")
     print(f"Atualizado {time.strftime('%H:%M:%S')} | {HEAD}")
     print("Atualizar agora | refresh=true")
 

@@ -17,7 +17,9 @@ fi
 # 2. Apontar o SwiftBar pra pasta plugins/ (só o plugin mora lá — evita o "?")
 defaults write com.ameba.SwiftBar PluginDirectory "$PLUGIN_DIR"
 
-# 3. Garantir que o plugin é executável
+# 3. Garantir que o plugin é executável (e limpar .pyc: SwiftBar tentaria rodar
+#    qualquer arquivo em plugins/, e um __pycache__/*.pyc vira um "?" no menu)
+rm -rf "$PLUGIN_DIR"/__pycache__
 chmod +x "$PLUGIN_DIR"/crabbar.*.py
 
 # 4. Abrir automaticamente no login (idempotente — não duplica)
