@@ -42,9 +42,10 @@ API_HEADERS = {
 # Resiliência: cache do último valor bom + backoff em 429 (estilo LimitBar).
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "crabbar")
 CACHE_FILE = os.path.join(CACHE_DIR, "usage.json")
-STALE_MAX_MIN = 60       # acima disso o cache é velho demais → indisponível
-BACKOFF_MIN_429 = 10     # após 429, não bate na API por N min (serve cache)
-FETCH_RETRIES = 2        # tentativas extras por execução em erro transitório
+STALE_MAX_MIN = 180      # acima disso o cache é velho demais → indisponível
+BACKOFF_MIN_429 = 10     # 1º 429: não bate na API por N min (serve cache)
+BACKOFF_MAX_429 = 60     # teto do backoff exponencial (10 → 20 → 40 → 60 min)
+FETCH_RETRIES = 2        # tentativas extras por execução em erro 5xx/rede
 
 # Modo de exibição do título (escolhível pelo menu do dropdown), salvo em prefs.
 PREFS_FILE = os.path.join(CACHE_DIR, "prefs.json")
@@ -378,20 +379,25 @@ def _write_cache(obj):
 
 
 def _fetch_usage_once(token):
-    """(status_code|None, body_bytes). status None = erro de rede/offline."""
+    """(status_code|None, body_bytes, retry_after_seg|None). status None = rede/offline."""
     headers = dict(API_HEADERS)
     headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(USAGE_URL, headers=headers, method="GET")
     try:
         resp = urllib.request.urlopen(req, timeout=20)
-        return 200, resp.read()
+        return 200, resp.read(), None
     except urllib.error.HTTPError as e:
+        ra = None
         try:
-            return e.code, e.read()
+            ra = float(e.headers.get("Retry-After")) if e.headers else None
+        except (TypeError, ValueError):
+            ra = None
+        try:
+            return e.code, e.read(), ra
         except Exception:
-            return e.code, b""
+            return e.code, b"", ra
     except (urllib.error.URLError, OSError):
-        return None, b""
+        return None, b"", None
 
 
 def _parse_usage_body(body):
@@ -421,13 +427,14 @@ def _parse_usage_body(body):
 
 
 def _stale_result(cache, now, note):
-    """Serve o último valor bom (se recente o bastante), senão None."""
-    if not cache or not cache.get("limits"):
-        return None
-    age = int(round((now - cache.get("ts", now)) / 60))
-    if age > STALE_MAX_MIN:
-        return None
-    return {"limits": cache["limits"], "stale": True, "age_min": max(0, age), "note": note}
+    """Sempre retorna dict com o MOTIVO; limits só se o cache for recente."""
+    if cache and cache.get("limits"):
+        age = int(round((now - cache.get("ts", now)) / 60))
+        if age <= STALE_MAX_MIN:
+            return {"limits": cache["limits"], "stale": True,
+                    "age_min": max(0, age), "note": note}
+        note = f"{note} · último dado de {fmt_mins(age)} atrás"
+    return {"limits": None, "stale": True, "age_min": 0, "note": note}
 
 
 def poll_limit():
@@ -435,7 +442,8 @@ def poll_limit():
 
     Zero token. Guarda o último valor bom em cache; em falha transitória
     (offline, 429, 5xx) serve o cache marcado como 'stale' em vez de sumir.
-    Em 429 sustentado, recua BACKOFF_MIN_429 min antes de bater de novo.
+    429 NÃO re-tenta na mesma execução (só pioraria o rate limit) e arma
+    backoff exponencial (10→20→40→60 min), respeitando Retry-After se vier.
     """
     if os.environ.get("CRAB_NO_PING") == "1":
         return None
@@ -444,17 +452,19 @@ def poll_limit():
 
     # Respeita o backoff: não bate na API enquanto a janela de 429 não passar.
     if cache and cache.get("backoff_until", 0) > now:
-        return _stale_result(cache, now, note="backoff 429")
+        wait_m = int((cache["backoff_until"] - now) / 60) + 1
+        return _stale_result(cache, now,
+                             note=f"rate limit 429 · nova tentativa em {wait_m}m")
 
     token = read_token()
     if not token:
         return _stale_result(cache, now, note="sem token")
 
-    transient = {429, 500, 502, 503, 504}
-    status, body = None, b""
+    retry_5xx = {500, 502, 503, 504}  # 429 fica de fora: re-tentar agrava
+    status, body, retry_after = None, b"", None
     for attempt in range(FETCH_RETRIES + 1):
-        status, body = _fetch_usage_once(token)
-        if status == 200 or (status is not None and status not in transient):
+        status, body, retry_after = _fetch_usage_once(token)
+        if status is not None and status not in retry_5xx:
             break
         if attempt < FETCH_RETRIES:
             time.sleep(1.5 * (attempt + 1))  # backoff curto dentro da execução
@@ -463,20 +473,28 @@ def poll_limit():
     if status in (401, 403):
         new = refresh_token(now)
         if new:
-            status, body = _fetch_usage_once(new)
+            status, body, retry_after = _fetch_usage_once(new)
 
     if status == 200:
         limits = _parse_usage_body(body)
         if limits:
-            _write_cache({"ts": now, "limits": limits, "backoff_until": 0})
+            _write_cache({"ts": now, "limits": limits,
+                          "backoff_until": 0, "strikes_429": 0})
             return {"limits": limits, "stale": False, "age_min": 0, "note": ""}
         return _stale_result(cache, now, note="resposta vazia")
 
-    # Falha: em 429 sustentado, arma o backoff; sempre serve o cache se houver.
-    if status == 429 and cache:
-        cache["backoff_until"] = now + BACKOFF_MIN_429 * 60
+    if status == 429:
+        strikes = int((cache or {}).get("strikes_429", 0)) + 1
+        wait = retry_after if retry_after else \
+            min(BACKOFF_MIN_429 * (2 ** (strikes - 1)), BACKOFF_MAX_429) * 60
+        cache = cache or {}
+        cache["backoff_until"] = now + min(wait, 3600)
+        cache["strikes_429"] = strikes
         _write_cache(cache)
-    return _stale_result(cache, now, note=("429" if status == 429 else "offline"))
+        return _stale_result(cache, now, note="rate limit 429")
+
+    note = "offline" if status is None else f"HTTP {status}"
+    return _stale_result(cache, now, note=note)
 
 
 # ----------------------------------------------------------------- formatting
@@ -575,9 +593,9 @@ def main():
                 segs.append(f"{l['short']} {pc}%")
         sep = "  " if mode == "reset" else " · "
         print(f"🦀 " + sep.join(segs) + tail + f" | color={TITLE}")
-    elif spend:
-        print(f"🦀 ${spend['all_cost']:.2f} | color={TITLE}")
     else:
+        # Sem limites → só o tracinho. (Antes caía no gasto total do ccusage,
+        # um $ acumulado sem contexto que assustava — o gasto vive no dropdown.)
         print(f"🦀 – | color={TITLE}")
 
     print("---")
@@ -604,7 +622,8 @@ def main():
     elif os.environ.get("CRAB_NO_PING") == "1":
         print(f"Limites: leitura desligada (CRAB_NO_PING=1) | {HEAD}")
     else:
-        print(f"Limites indisponíveis (sem token ou offline) | {HEAD}")
+        why = (lim or {}).get("note") or "sem token ou offline"
+        print(f"Limites indisponíveis — {why} | {HEAD}")
 
     print("---")
 

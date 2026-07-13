@@ -69,7 +69,7 @@ Instala o SwiftBar (se faltar), aponta a pasta de plugins pra `plugins/`, **regi
 ## Nunca fica na mão (resiliência)
 
 - **Último valor bom em cache** (`~/.cache/crabbar/`): se você ficar offline ou a API der soluço, ele mostra o último número com um **⏳** em cinza, em vez de apagar tudo.
-- **Retry + backoff**: re-tenta erros transitórios e, se levar `429` de propósito, recua uns minutos servindo o cache — sem martelar a API.
+- **Retry + backoff**: re-tenta erros de rede/5xx e, se levar `429` (rate limit), **não insiste**: recua com backoff exponencial (10 → 20 → 40 → 60 min, ou o que o header `Retry-After` mandar) servindo o cache — sem martelar a API. Quando os limites estão fora do ar, o dropdown diz o motivo real (`rate limit 429 · nova tentativa em 12m`, `sem token`, `offline`) e o título mostra `🦀 –` (o gasto do ccusage fica só no dropdown, com rótulo).
 - **Auto-refresh do token** (opcional): se o login expirar, renova sozinho pelo fluxo OAuth oficial da Anthropic e regrava no Keychain — o mesmo que o Claude Code faz. **Desligado por padrão**; ligue com `CRAB_AUTO_REFRESH=1`.
 
 ## Variáveis de ambiente
